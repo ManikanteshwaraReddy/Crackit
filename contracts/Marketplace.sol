@@ -1,6 +1,6 @@
 // SPDX-License-Identifier:UNLICENSED
 pragma solidity ^0.8.19;
-
+import "./Escrow.sol";
 
 contract Marketplace {
     /* ProductStatus[0] == open, ProductStatus[1] == sold etc.. */
@@ -183,4 +183,61 @@ contract Marketplace {
         }
     }
 
+    /* if you are the buyer and highestbidder and the contract has been closed, you send the money to the escrow */
+    function sendToEscrow(uint256 _productId) public payable {
+        Product storage product = stores[productIdInStore[_productId]][
+            _productId
+        ];
+
+        address seller = productIdInStore[_productId];
+        
+        require(product.highestBidder == msg.sender);
+        require((product.highestBid)*(1000000000000000000)==msg.value,"Insufficient amount");
+        require(product.status == ProductStatus.Sold);
+
+        Escrow escrow = (new Escrow){value:msg.value}(_productId, msg.sender, seller);
+        productEscrow[_productId] = address(escrow);
+    }
+
+    /* get the escrow contract address for a product */
+    function escrowAddressForProduct(uint256 _productId)
+        public
+        view
+        returns (address)
+    {
+        return productEscrow[_productId];
+    }
+
+    /* get all the info on the escrow contract (buyer, seller, fundsDisbursed yes/no) */
+    function escrowInfo(uint256 _productId)
+        public
+        view
+        returns (
+            address,
+            address,
+            bool
+        )
+    {
+        return Escrow(productEscrow[_productId]).escrowInfo();
+    }
+
+    /* give the funds in the escrow contract to the seller */
+    function releaseToSeller(uint256 _productId) public{
+        require(msg.sender==stores[productIdInStore[_productId]][_productId].highestBidder);
+        Escrow(productEscrow[_productId]).releaseToSeller();
+        Product storage product = stores[productIdInStore[_productId]][
+            _productId
+        ];
+        product.status = ProductStatus.Sold;
+    }
+
+    /* refund the funds in the escrow contract to the buyer */
+    function refundToBuyer(uint256 _productId) public {
+        require(msg.sender==productIdInStore[_productId]);
+        Escrow(productEscrow[_productId]).refundToBuyer();
+        Product storage product = stores[productIdInStore[_productId]][
+            _productId
+        ];
+        product.status = ProductStatus.Open;
+    }
 }
