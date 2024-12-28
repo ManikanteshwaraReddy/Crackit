@@ -1,15 +1,21 @@
-// SPDX-License-Identifier:UNLICENSED
-pragma solidity ^0.8.19;
-import "./Escrow.sol";
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.28;
+
+import "./DeKToken.sol"; // Import DeK token contract
+import "./Escrow.sol";   // Import Escrow contract
 
 contract Marketplace {
-    /* ProductStatus[0] == open, ProductStatus[1] == sold etc.. */
+    DeKToken public deKToken;
+    address public owner;
+
     enum ProductStatus {
         Open,
-        pending,
+        Pending,
         Sold,
-        Unsold
+        Unsold,
+        Closed
     }
+
     enum ProductCondition {
         New,
         Used
@@ -17,22 +23,16 @@ contract Marketplace {
 
     uint256 public productIndex;
 
-    /* every product can have an address to an escrow contract to store a final bid */
     mapping(uint256 => address) public productEscrow;
-
-    /* every address can have there own store with listed products, of which every product is a product struct*/
-    /* user adds first product: 0x64fcba11d3dce1e3f781e22ec2b61001d2c652e5 => {1 => "struct with iphone details"} */
     mapping(address => mapping(uint256 => Product)) public stores;
-
-    /* which products are in whose store */
     mapping(uint256 => address) public productIdInStore;
 
-    /* contract constructor */
-    constructor() {
+    constructor(address _deKTokenAddress) {
         productIndex = 0;
+        owner = msg.sender;
+        deKToken = DeKToken(_deKTokenAddress);
     }
 
-    /* event to which the server can listen and then copy the data to mongo when a new product is added */
     event NewProduct(
         uint256 _productId,
         string _name,
@@ -42,6 +42,8 @@ contract Marketplace {
     );
 
     event NewBid(address _bidder, uint256 _productId, uint256 _amount);
+    event ProductAdded(uint256 productId, string name, uint256 price);
+    event ProductPurchased(uint256 productId, address buyer, uint256 ethPaid, uint256 dekPaid);
 
     struct Product {
         uint256 id;
@@ -56,7 +58,18 @@ contract Marketplace {
         mapping(address => Bid) bids;
     }
 
-    /* add new product */
+    struct Bid {
+        address bidder;
+        uint256 productId;
+        uint256 amount;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can perform this action");
+        _;
+    }
+
+    // Add new product
     function addProduct(
         string memory _name,
         string memory _category,
@@ -64,9 +77,6 @@ contract Marketplace {
         uint256 _productCondition
     ) public {
         productIndex += 1;
-
-        /* create new product with arguments as input */
-        // Product storage product = stores[msg.sender][productIndex];
         Product storage product = stores[msg.sender][productIndex];
         product.id = productIndex;
         product.name = _name;
@@ -75,10 +85,8 @@ contract Marketplace {
         product.status = ProductStatus.Open;
         product.condition = ProductCondition(_productCondition);
 
-        /* productIndex->address */
         productIdInStore[productIndex] = msg.sender;
 
-        /* trigger event to let the front-end know that a new product has been added */
         emit NewProduct(
             productIndex,
             _name,
@@ -88,156 +96,145 @@ contract Marketplace {
         );
     }
 
-    function getProduct(uint256 _productId)
-        public
-        view
-        returns (
-            uint256,
-            string memory,
-            string memory,
-            uint256,
-            ProductStatus,
-            ProductCondition,
-            uint256,
-            uint256
-        )
-    {
-        /* fist get address with productnumber, then get the product with that address and id */
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
+    // Create product
+    function createProduct(string memory _name, string memory _category, uint256 _price) external {
+        uint256 productId = uint256(keccak256(abi.encodePacked(_name, _category, msg.sender, block.timestamp)));
+        Product storage product = stores[msg.sender][productId];
+        product.id = productId;
+        product.name = _name;
+        product.category = _category;
+        product.startPrice = _price;
+        product.status = ProductStatus.Open;
+        productIdInStore[productId] = msg.sender;
 
-        return (
-            product.id,
-            product.name,
-            product.category,
-            product.startPrice,
-            product.status,
-            product.condition,
-            product.totalBids,
-            product.highestBid
-        );
+        emit ProductAdded(productId, _name, _price);
     }
 
-    struct Bid {
-        address bidder;
-        uint256 productId;
-        uint256 amount;
-    }
+    // Bid on a product
+    function bid(uint256 _productId, uint256 _amount) public {
+        Product storage product = stores[productIdInStore[_productId]][_productId];
+        require(product.status == ProductStatus.Open, "Bidding is not allowed on this product");
+        require(msg.sender != productIdInStore[_productId], "Seller cannot bid on their own product");
+        require(_amount > product.highestBid, "Bid amount must be higher than the current highest bid");
 
-    /* bid on a product */
-    function bid(uint256 _productId, uint256 _amount) public returns (bool) {
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
-        require(msg.sender!=productIdInStore[_productId]);
-        require(product.status == ProductStatus.Open);
-       
+        product.bids[msg.sender] = Bid({
+            bidder: msg.sender,
+            productId: _productId,
+            amount: _amount
+        });
 
-        if (_amount > product.highestBid) {
-            product.highestBid = _amount;
-            product.highestBidder = msg.sender;
-        }
-        product.bids[msg.sender] = Bid(msg.sender, _productId, _amount);
-
+        product.highestBid = _amount;
+        product.highestBidder = msg.sender;
         product.totalBids += 1;
 
         emit NewBid(msg.sender, _productId, _amount);
-
-        return true;
     }
 
-    /* see who is the current hightest bidder with the highest bid */
-    function highestBidderInfo(uint256 _productId)
-        public
-        view
-        returns (address, uint256)
-    {
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
+    // Get highest bidder info
+    function highestBidderInfo(uint256 _productId) public view returns (address, uint256) {
+        Product storage product = stores[productIdInStore[_productId]][_productId];
         return (product.highestBidder, product.highestBid);
     }
 
-    /* return the total number of bids on a product */
+    // Get total bids on a product
     function totalBids(uint256 _productId) public view returns (uint256) {
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
+        Product storage product = stores[productIdInStore[_productId]][_productId];
         return product.totalBids;
     }
 
-    /* close the auction */
+    // Close auction
     function closeAuction(uint256 _productId) public {
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
-
-        require(productIdInStore[_productId] == msg.sender);
-        require(product.status == ProductStatus.Open);
+        Product storage product = stores[productIdInStore[_productId]][_productId];
+        require(productIdInStore[_productId] == msg.sender, "Only the seller can close the auction");
+        require(product.status == ProductStatus.Open, "Auction is not open");
 
         if (product.totalBids == 0) {
             product.status = ProductStatus.Unsold;
         } else {
-            product.status = ProductStatus.Sold;
+            product.status = ProductStatus.Closed;
         }
     }
 
-    /* if you are the buyer and highestbidder and the contract has been closed, you send the money to the escrow */
-    function sendToEscrow(uint256 _productId) public payable {
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
+    // Purchase product
+    function buyProduct(uint256 _productId, uint256 _dekAmount) public payable {
+    Product storage product = stores[productIdInStore[_productId]][_productId];
+    require(product.status == ProductStatus.Open, "Product not available");
+    require(msg.sender != productIdInStore[_productId], "Seller cannot buy their own product");
 
-        address seller = productIdInStore[_productId];
-        
-        require(product.highestBidder == msg.sender);
-        require((product.highestBid)*(1000000000000000000)==msg.value,"Insufficient amount");
-        require(product.status == ProductStatus.Sold);
+    uint256 dekValueInEth = _dekAmount / 10; // 10 DeK = 1 ETH
+    uint256 totalEthPaid = msg.value + dekValueInEth;
 
-        Escrow escrow = (new Escrow){value:msg.value}(_productId, msg.sender, seller);
-        productEscrow[_productId] = address(escrow);
+    require(totalEthPaid >= product.startPrice, "Insufficient funds");
+
+    // Transfer DeK tokens directly from the buyer to the contract
+    if (_dekAmount > 0) {
+        require(deKToken.transferFrom(msg.sender, address(this), _dekAmount), "DeK token transfer failed");
     }
 
-    /* get the escrow contract address for a product */
-    function escrowAddressForProduct(uint256 _productId)
+    // Create the escrow contract with the ETH value and DeK token
+    Escrow escrow = (new Escrow){value: msg.value}(_productId, msg.sender, productIdInStore[_productId], deKToken);
+    productEscrow[_productId] = address(escrow);
+
+    if (_dekAmount > 0) {
+        escrow.depositDeK(_dekAmount);
+    }
+
+    // Mark the product as pending
+    product.status = ProductStatus.Pending;
+    emit ProductPurchased(_productId, msg.sender, msg.value, _dekAmount);
+}
+
+    // Release funds to the seller
+    function releaseToSeller(uint256 _productId) public {
+        require(msg.sender == stores[productIdInStore[_productId]][_productId].highestBidder, "Only the highest bidder can release funds");
+        Escrow(productEscrow[_productId]).releaseToSeller();
+        Product storage product = stores[productIdInStore[_productId]][_productId];
+        product.status = ProductStatus.Sold;
+    }
+
+    // Refund funds to the buyer
+    function refundToBuyer(uint256 _productId) public {
+        require(msg.sender == productIdInStore[_productId], "Only the seller can initiate a refund");
+        Escrow(productEscrow[_productId]).refundToBuyer();
+        Product storage product = stores[productIdInStore[_productId]][_productId];
+        product.status = ProductStatus.Open;
+    }
+
+    // Get product info
+    function getProduct(uint256 _productId)
         public
         view
-        returns (address)
+        returns (
+            string memory,
+            string memory,
+            uint256,
+            address,
+            ProductStatus
+        )
     {
-        return productEscrow[_productId];
+        Product storage product = stores[productIdInStore[_productId]][_productId];
+        return (
+            product.name,
+            product.category,
+            product.startPrice,
+            productIdInStore[_productId],
+            product.status
+        );
     }
 
-    /* get all the info on the escrow contract (buyer, seller, fundsDisbursed yes/no) */
-    function escrowInfo(uint256 _productId)
+    // Get escrow info
+    function getEscrowInfo(uint256 _productId)
         public
         view
         returns (
             address,
             address,
+            uint256,
+            uint256,
             bool
         )
     {
-        return Escrow(productEscrow[_productId]).escrowInfo();
-    }
-
-    /* give the funds in the escrow contract to the seller */
-    function releaseToSeller(uint256 _productId) public{
-        require(msg.sender==stores[productIdInStore[_productId]][_productId].highestBidder);
-        Escrow(productEscrow[_productId]).releaseToSeller();
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
-        product.status = ProductStatus.Sold;
-    }
-
-    /* refund the funds in the escrow contract to the buyer */
-    function refundToBuyer(uint256 _productId) public {
-        require(msg.sender==productIdInStore[_productId]);
-        Escrow(productEscrow[_productId]).refundToBuyer();
-        Product storage product = stores[productIdInStore[_productId]][
-            _productId
-        ];
-        product.status = ProductStatus.Open;
+        Escrow escrow = Escrow(productEscrow[_productId]);
+        return escrow.escrowInfo();
     }
 }
